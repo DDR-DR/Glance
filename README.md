@@ -105,6 +105,12 @@ sudo xattr -cr /Applications/Glance.app
 3. 在弹出的对话框中再次选择“打开”。
 4. 如果依然无法运行，请前往 **系统设置 > 隐私与安全性**，点击下方的“仍要打开”。
 
+### 更新后截图全黑
+
+Glance 目前使用临时签名，macOS 可能会把更新后的版本识别为一个新应用，导致旧版本的屏幕录制授权不再生效。请前往 **系统设置 > 隐私与安全性 > 屏幕与系统音频录制**（旧版 macOS 为“屏幕录制”），将 Glance 的开关关闭后重新开启，再完全退出并重新打开 Glance。
+
+如果设置中没有 Glance，先运行一次截图功能触发授权提示；仍无法恢复时，可在终端执行 `tccutil reset ScreenCapture com.harukaon.glance`，重新打开 Glance 并再次授权。
+
 ## 许可证
 
 MIT

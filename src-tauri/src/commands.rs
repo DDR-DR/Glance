@@ -585,6 +585,10 @@ async fn begin_capture_impl(app: &AppHandle, state: &SharedState) -> AppResult<(
     {
         let dir = capture::debug_reset_dir()?;
         capture::debug_log(format!("[begin] debug dir={}", dir.display()));
+        // Check before hiding the main window. Without permission macOS returns
+        // a valid-looking black frame, which previously became a fullscreen
+        // black overlay and looked like the external display had powered off.
+        capture::ensure_screen_capture_permission()?;
     }
 
     let t0 = std::time::Instant::now();

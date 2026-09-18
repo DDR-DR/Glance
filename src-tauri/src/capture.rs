@@ -345,6 +345,27 @@ fn get_cursor_position() -> Result<(i32, i32), String> {
 
 // ── Screen capture ──────────────────────────────────────────────────────────
 
+/// Stop before opening a black capture overlay when macOS revoked screen access.
+/// Ad-hoc signed builds receive a different identity after every update, so the
+/// user may need to grant this permission again even if an older build worked.
+#[cfg(target_os = "macos")]
+pub fn ensure_screen_capture_permission() -> AppResult<()> {
+    use core_graphics::access::ScreenCaptureAccess;
+
+    let access = ScreenCaptureAccess;
+    if access.preflight() || access.request() {
+        return Ok(());
+    }
+
+    let _ = Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+        .spawn();
+
+    Err(AppError::Capture(
+        "macOS 未授予 Glance 屏幕录制权限。请在“系统设置 → 隐私与安全性 → 屏幕与系统音频录制”中允许 Glance；若已开启，请关闭后重新开启，并完全退出 Glance 后重试。应用更新后可能需要重新授权。".into(),
+    ))
+}
+
 /// Whether Linux should use the X11 capture path.
 /// An explicit session type wins over a possibly stale WAYLAND_DISPLAY variable.
 #[cfg(target_os = "linux")]
@@ -621,6 +642,38 @@ fn virtual_desktop_bounds(monitors: &[(i32, i32, u32, u32)]) -> AppResult<(i32, 
     ))
 }
 
+#[cfg(target_os = "macos")]
+fn screencapture_display_number(display_id: u32) -> AppResult<u32> {
+    use core_graphics::display::CGDisplay;
+
+    let main_display_id = CGDisplay::main().id;
+    let active_displays = CGDisplay::active_displays()
+        .map_err(|error| AppError::Capture(format!("failed to list active displays: {error}")))?;
+    screencapture_display_number_from(&active_displays, main_display_id, display_id).ok_or_else(
+        || AppError::Capture(format!("display {display_id} is no longer active")),
+    )
+}
+
+/// `screencapture -D` expects 1 for the main display and ordinal numbers for
+/// secondary displays, not a CoreGraphics display ID.
+#[cfg(target_os = "macos")]
+fn screencapture_display_number_from(
+    active_displays: &[u32],
+    main_display_id: u32,
+    display_id: u32,
+) -> Option<u32> {
+    if display_id == main_display_id {
+        return Some(1);
+    }
+
+    active_displays
+        .iter()
+        .copied()
+        .filter(|id| *id != main_display_id)
+        .position(|id| id == display_id)
+        .map(|index| index as u32 + 2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{display_index_at_pointer, physical_display_geometry, virtual_desktop_bounds};
@@ -672,6 +725,16 @@ mod tests {
         assert!(!super::linux_uses_x11_with(None, true));
         assert!(super::linux_uses_x11_with(None, false));
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn maps_core_graphics_ids_to_screencapture_ordinals() {
+        let active = [91, 42, 77];
+        assert_eq!(super::screencapture_display_number_from(&active, 42, 42), Some(1));
+        assert_eq!(super::screencapture_display_number_from(&active, 42, 91), Some(2));
+        assert_eq!(super::screencapture_display_number_from(&active, 42, 77), Some(3));
+        assert_eq!(super::screencapture_display_number_from(&active, 42, 999), None);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -679,12 +742,17 @@ fn capture_screen_with_preview_macos(display_id: u32) -> AppResult<CapturedScree
     let started = std::time::Instant::now();
     let capture_path = temp_capture_path("jpg");
 
-    let display_id_str = display_id.to_string();
+    let display_number = screencapture_display_number(display_id)?;
+    let display_number_str = display_number.to_string();
+    debug_log(format!(
+        "[capture] CoreGraphics display id={} -> screencapture display number={}",
+        display_id, display_number
+    ));
     let status = Command::new("screencapture")
         .args([
             "-x",
             "-D",
-            &display_id_str,
+            &display_number_str,
             "-t",
             "jpg",
             capture_path.to_string_lossy().as_ref(),
