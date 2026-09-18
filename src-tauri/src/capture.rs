@@ -124,7 +124,7 @@ fn screen_at_pointer(x: i32, y: i32) -> Result<CaptureScreen, String> {
 
 /// Index of the physical display rectangle containing the point.
 /// Split out from `screen_at_pointer` so the mapping can be unit-tested anywhere.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn display_index_at_pointer(rects: &[(i32, i32, u32, u32)], x: i32, y: i32) -> Option<usize> {
     rects.iter().position(|(rx, ry, rw, rh)| {
         let right = *rx as i64 + *rw as i64;
