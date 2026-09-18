@@ -345,38 +345,136 @@ fn get_cursor_position() -> Result<(i32, i32), String> {
 
 // ── Screen capture ──────────────────────────────────────────────────────────
 
+/// Whether Linux should use the X11 capture path.
+/// An explicit session type wins over a possibly stale WAYLAND_DISPLAY variable.
+#[cfg(target_os = "linux")]
+fn linux_uses_x11() -> bool {
+    linux_uses_x11_with(
+        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_uses_x11_with(session_type: Option<&str>, wayland_display_present: bool) -> bool {
+    match session_type {
+        Some("x11") => true,
+        Some("wayland") => false,
+        _ => !wayland_display_present,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn x11_capture_region(x: i32, y: i32, width: u32, height: u32) -> AppResult<Vec<u8>> {
+    use xcb::x::{Drawable, GetImage, ImageFormat, ImageOrder};
+
+    if width > u16::MAX as u32 || height > u16::MAX as u32 {
+        return Err(AppError::Capture("X11 capture region is too large".into()));
+    }
+
+    let (conn, screen_index) = xcb::Connection::connect(None)
+        .map_err(|e| AppError::Capture(format!("failed to connect to X server: {e}")))?;
+    let setup = conn.get_setup();
+    let screen = setup
+        .roots()
+        .nth(screen_index as usize)
+        .ok_or_else(|| AppError::Capture("X server reported no screen".into()))?;
+    let reply = conn
+        .wait_for_reply(conn.send_request(&GetImage {
+            format: ImageFormat::ZPixmap,
+            drawable: Drawable::Window(screen.root()),
+            x: x as i16,
+            y: y as i16,
+            width: width as u16,
+            height: height as u16,
+            plane_mask: u32::MAX,
+        }))
+        .map_err(|e| AppError::Capture(format!("X11 GetImage failed: {e}")))?;
+
+    let depth = reply.depth();
+    let bits_per_pixel = setup
+        .pixmap_formats()
+        .iter()
+        .find(|format| format.depth() == depth)
+        .map(|format| format.bits_per_pixel() as u32)
+        .ok_or_else(|| AppError::Capture(format!("X11 pixel format missing for depth {depth}")))?;
+    let bit_order = setup.bitmap_format_bit_order();
+    let bytes = reply.data();
+    let mut rgba = vec![0; (width as usize) * (height as usize) * 4];
+
+    for row in 0..height {
+        for column in 0..width {
+            let source_index = ((row * width + column) * bits_per_pixel / 8) as usize;
+            let (red, green, blue) = match bits_per_pixel {
+                24 | 32 => {
+                    if bit_order == ImageOrder::LsbFirst {
+                        (bytes[source_index + 2], bytes[source_index + 1], bytes[source_index])
+                    } else {
+                        (bytes[source_index], bytes[source_index + 1], bytes[source_index + 2])
+                    }
+                }
+                _ => {
+                    return Err(AppError::Capture(format!(
+                        "unsupported X11 pixel format: {bits_per_pixel} bits per pixel"
+                    )))
+                }
+            };
+            let target_index = ((row * width + column) * 4) as usize;
+            rgba[target_index..target_index + 4]
+                .copy_from_slice(&[red, green, blue, 255]);
+        }
+    }
+
+    Ok(rgba)
+}
+
+/// Capture one display, forcing X11 when the desktop session is X11.
+#[cfg(target_os = "linux")]
+fn capture_linux_screen(screen: CaptureScreen) -> AppResult<(Vec<u8>, u32, u32)> {
+    let info = &screen.display_info;
+    if linux_uses_x11() {
+        let (x, y, width, height) = physical_display_geometry(
+            info.x,
+            info.y,
+            info.width,
+            info.height,
+            info.scale_factor,
+        )?;
+        let rgba = x11_capture_region(x, y, width, height)?;
+        Ok((rgba, width, height))
+    } else {
+        let image = screen
+            .capture()
+            .map_err(|e| AppError::Capture(e.to_string()))?;
+        let width = image.width();
+        let height = image.height();
+        Ok((image.into_raw(), width, height))
+    }
+}
+
 /// Capture the screen to raw RGBA bytes in memory (no file I/O).
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub fn capture_screen_to_memory(screen: CaptureScreen) -> AppResult<(Vec<u8>, u32, u32)> {
+    let t0 = std::time::Instant::now();
+    let result = capture_linux_screen(screen);
+    tracing::info!("[PERF][capture] Linux screen capture: {:?}", t0.elapsed());
+    result
+}
+
+/// Capture the screen to raw RGBA bytes in memory (no file I/O).
+#[cfg(target_os = "windows")]
 pub fn capture_screen_to_memory(screen: CaptureScreen) -> AppResult<(Vec<u8>, u32, u32)> {
     let t0 = std::time::Instant::now();
     let capture = screen
         .capture()
         .map_err(|e| AppError::Capture(e.to_string()))?;
-    #[cfg(target_os = "windows")]
     tracing::info!(
         "[PERF][capture] screen.capture() (BitBlt): {:?}",
         t0.elapsed()
     );
-    #[cfg(target_os = "macos")]
-    tracing::info!(
-        "[PERF][capture] screen.capture() (CoreGraphics): {:?}",
-        t0.elapsed()
-    );
-    #[cfg(target_os = "linux")]
-    tracing::info!("[PERF][capture] screen.capture(): {:?}", t0.elapsed());
-
     let w = capture.width();
     let h = capture.height();
-    let rgba_bytes = capture.into_raw();
-    tracing::info!(
-        "[PERF][capture] raw RGBA bytes: {} ({:.1} MB), {}x{}",
-        rgba_bytes.len(),
-        rgba_bytes.len() as f64 / 1_048_576.0,
-        w,
-        h
-    );
-
-    Ok((rgba_bytes, w, h))
+    Ok((capture.into_raw(), w, h))
 }
 
 #[cfg(target_os = "macos")]
@@ -564,6 +662,15 @@ mod tests {
         assert_eq!(display_index_at_pointer(&rects, 10, -1), Some(1));
         assert_eq!(display_index_at_pointer(&rects, 10, -900), Some(1));
         assert_eq!(display_index_at_pointer(&rects, 10, 0), Some(0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_x11_session_wins_over_stale_wayland_display() {
+        assert!(super::linux_uses_x11_with(Some("x11"), true));
+        assert!(!super::linux_uses_x11_with(Some("wayland"), false));
+        assert!(!super::linux_uses_x11_with(None, true));
+        assert!(super::linux_uses_x11_with(None, false));
     }
 }
 

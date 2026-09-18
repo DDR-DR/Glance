@@ -567,9 +567,11 @@ async fn begin_capture_with_mode(
     *state.capture_mode.write().await = mode;
 
     let result = begin_capture_impl(&app, state.inner()).await;
-    if result.is_err() {
+    if let Err(err) = &result {
+        tracing::error!("capture failed: {err}");
         reset_capture_state(state.inner()).await;
-        emit_workflow_state(&app, "", "", false).ok();
+        let message = format!("截图失败：{err}");
+        emit_workflow_state(&app, &message, "error", false).ok();
     }
     result
 }
@@ -736,7 +738,8 @@ async fn begin_capture_impl(app: &AppHandle, state: &SharedState) -> AppResult<(
         let (event_tx, event_rx) = mpsc::channel::<CaptureEvent>();
         capture_window::start_capture(
             rgba.clone(), w, h, scale_factor, desktop.x, desktop.y, desktop.monitor_count, event_tx,
-        );
+        )
+        .map_err(AppError::Capture)?;
         tracing::info!("[PERF] start_capture_native: {:?}", t0.elapsed());
 
         let state_clone = state.clone();

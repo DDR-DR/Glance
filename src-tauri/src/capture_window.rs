@@ -63,18 +63,24 @@ pub fn capture_proxy() -> EventLoopProxy<CaptureCommand> {
             std::thread::Builder::new()
                 .name("capture-event-loop".into())
                 .spawn(move || {
+                    let mut builder = EventLoop::<CaptureCommand>::with_user_event();
                     #[cfg(target_os = "windows")]
-                    let event_loop = {
+                    {
                         use winit::platform::windows::EventLoopBuilderExtWindows;
-                        EventLoop::<CaptureCommand>::with_user_event()
-                            .with_any_thread(true)
-                            .build()
-                            .expect("failed to build winit event loop")
-                    };
-                    #[cfg(not(target_os = "windows"))]
-                    let event_loop = EventLoop::<CaptureCommand>::with_user_event()
+                        builder.with_any_thread(true);
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        // winit prefers Wayland whenever WAYLAND_DISPLAY exists.
+                        // Honor an explicit X11 desktop session instead.
+                        if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("x11") {
+                            use winit::platform::x11::EventLoopBuilderExtX11;
+                            builder.with_x11();
+                        }
+                    }
+                    let event_loop = builder
                         .build()
-                        .expect("failed to build winit event loop");
+                        .expect("failed to build capture event loop");
 
                     let proxy = event_loop.create_proxy();
                     let _ = proxy_tx.send(proxy);
@@ -103,17 +109,19 @@ pub fn start_capture(
     desktop_y: i32,
     monitor_count: usize,
     event_tx: mpsc::Sender<CaptureEvent>,
-) {
-    let _ = capture_proxy().send_event(CaptureCommand::StartCapture {
-        rgba,
-        img_w,
-        img_h,
-        scale_factor,
-        desktop_x,
-        desktop_y,
-        monitor_count,
-        event_tx,
-    });
+) -> Result<(), String> {
+    capture_proxy()
+        .send_event(CaptureCommand::StartCapture {
+            rgba,
+            img_w,
+            img_h,
+            scale_factor,
+            desktop_x,
+            desktop_y,
+            monitor_count,
+            event_tx,
+        })
+        .map_err(|e| format!("failed to start capture window: {e}"))
 }
 
 // ── Internal handler ──────────────────────────────────────────────────────────
