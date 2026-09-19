@@ -693,7 +693,72 @@ async fn begin_capture_impl(app: &AppHandle, state: &SharedState) -> AppResult<(
         emit_workflow_state(app, capture_prompt_message(state).await, "", false)?;
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        // B1: Windows single-screen fallback (Issue #26).
+        // Only capture the monitor under the cursor and cover it with a
+        // borderless fullscreen window (monitor_count = 1). This matches the
+        // mature per-display approach (PowerToys OCR, ShareX, Flameshot) and
+        // avoids the cross-monitor virtual-desktop window introduced in
+        // 83aecd7, which paints black when Windows re-scales it under
+        // per-monitor DPI. Trade-off: cross-monitor drag from #16 is
+        // temporarily unavailable on Windows; capture each display by
+        // invoking capture on that display. Linux keeps virtual desktop.
+        let result = tokio::task::spawn_blocking(capture::find_cursor_monitor)
+            .await
+            .map_err(|e| AppError::Capture(format!("find monitor task failed: {e}")))??;
+
+        let monitor = result.monitor;
+        tracing::info!(
+            "[PERF] find_cursor_monitor: {:?} (scale={})",
+            t0.elapsed(),
+            monitor.scale_factor
+        );
+
+        let scale_factor = monitor.scale_factor;
+        let screen = result.screen;
+        let (rgba, w, h) =
+            tokio::task::spawn_blocking(move || capture::capture_screen_to_memory(screen))
+                .await
+                .map_err(|e| AppError::Capture(format!("capture task failed: {e}")))??;
+
+        tracing::info!(
+            "[PERF] capture_cursor_monitor: {:?} | {}x{} ({:.1} MB RGBA)",
+            t0.elapsed(),
+            w,
+            h,
+            rgba.len() as f64 / 1_048_576.0
+        );
+
+        *state.capture_session.write().await = Some(crate::app_state::ActiveCaptureSession {
+            rgba: rgba.clone(),
+            img_w: w,
+            img_h: h,
+            scale_factor,
+            monitor_x: monitor.x,
+            monitor_y: monitor.y,
+            monitor_width: monitor.width,
+            monitor_height: monitor.height,
+            preview_image_base64: None,
+            preview_image_mime: String::new(),
+            restore_main_window,
+        });
+
+        let (event_tx, event_rx) = mpsc::channel::<CaptureEvent>();
+        capture_window::start_capture(
+            rgba.clone(), w, h, scale_factor, monitor.x, monitor.y, 1, event_tx,
+        )
+        .map_err(AppError::Capture)?;
+        tracing::info!("[PERF] start_capture_native: {:?}", t0.elapsed());
+
+        let state_clone = state.clone();
+        let app_clone = app.clone();
+        tokio::spawn(async move {
+            handle_capture_events(event_rx, rgba, w, scale_factor, state_clone, app_clone).await;
+        });
+    }
+
+    #[cfg(target_os = "linux")]
     {
         let result = tokio::task::spawn_blocking(capture::find_cursor_monitor)
             .await

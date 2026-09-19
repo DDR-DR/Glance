@@ -34,7 +34,8 @@ pub struct CursorMonitorResult {
 }
 
 /// A single RGBA snapshot of the complete virtual desktop.
-#[cfg(not(target_os = "macos"))]
+/// Linux-only after B1: Windows uses the single-screen cursor-monitor path.
+#[cfg(target_os = "linux")]
 pub struct VirtualDesktopCapture {
     pub rgba: Vec<u8>,
     pub x: i32,
@@ -483,14 +484,23 @@ pub fn capture_screen_to_memory(screen: CaptureScreen) -> AppResult<(Vec<u8>, u3
 }
 
 /// Capture the screen to raw RGBA bytes in memory (no file I/O).
+///
+/// Windows single-screen path for B1 (Issue #26): `display-info` reports the
+/// monitor geometry in physical pixels for the DPI-aware capture process, while
+/// `screenshots::Screen::capture()` multiplies it by `scale_factor` again. On a
+/// 4K display with OS scaling that mismatch makes the capture/window sizes
+/// disagree and the overlay falls back to black. Capture the reported physical
+/// rectangle directly instead, matching the approach validated in PR #21 and
+/// the upstream xcap fix for multi-monitor offsets.
 #[cfg(target_os = "windows")]
 pub fn capture_screen_to_memory(screen: CaptureScreen) -> AppResult<(Vec<u8>, u32, u32)> {
     let t0 = std::time::Instant::now();
+    let info = screen.display_info;
     let capture = screen
-        .capture()
+        .capture_area_ignore_area_check(0, 0, info.width, info.height)
         .map_err(|e| AppError::Capture(e.to_string()))?;
     tracing::info!(
-        "[PERF][capture] screen.capture() (BitBlt): {:?}",
+        "[PERF][capture] screen.capture_area_ignore_area_check (BitBlt): {:?}",
         t0.elapsed()
     );
     let w = capture.width();
@@ -516,7 +526,9 @@ pub fn capture_interactive_region() -> AppResult<Option<InteractiveCaptureImage>
 
 /// Capture every display and combine the snapshots into one virtual desktop.
 /// Window coordinates and selection coordinates use physical pixels.
-#[cfg(not(target_os = "macos"))]
+/// Linux-only after B1: Windows uses the single-screen cursor-monitor path to
+/// avoid the cross-monitor overlay black screen (Issue #26).
+#[cfg(target_os = "linux")]
 pub fn capture_virtual_desktop_to_memory() -> AppResult<VirtualDesktopCapture> {
     let screens = CaptureScreen::all().map_err(|e| AppError::Capture(e.to_string()))?;
     if screens.is_empty() {
@@ -584,6 +596,7 @@ pub fn capture_virtual_desktop_to_memory() -> AppResult<VirtualDesktopCapture> {
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn physical_display_geometry(
     x: i32,
     y: i32,
@@ -620,6 +633,7 @@ fn physical_display_geometry(
     ))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn virtual_desktop_bounds(monitors: &[(i32, i32, u32, u32)]) -> AppResult<(i32, i32, u32, u32)> {
     let min_x = monitors.iter().map(|(x, _, _, _)| *x as i64).min()
         .ok_or_else(|| AppError::Capture("no monitors found".into()))?;
