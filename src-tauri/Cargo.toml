@@ -40,9 +40,12 @@ objc2-app-kit = { version = "0.2.2", features = ["NSWindow", "NSEvent"] }
 winreg = "0.55"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Already pulled in transitively by `screenshots`/`display-info`; used directly to
-# read the global pointer position (Wayland has no equivalent API).
-xcb = "1.3"
+# `xcb` was already pulled in transitively via `screenshots`; depended on directly
+# to query the pointer, read the root window size and enumerate monitors over
+# XRandR. `display-info` is likewise a transitive dep of `screenshots`, named here
+# so `Screen::display_info` can be referred to by type.
+xcb = { version = "1.3", features = ["randr"] }
+display-info = "0.4"
 
 [features]
 default = []

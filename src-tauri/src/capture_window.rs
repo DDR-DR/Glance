@@ -73,10 +73,18 @@ pub fn capture_proxy() -> EventLoopProxy<CaptureCommand> {
                     {
                         // winit prefers Wayland whenever WAYLAND_DISPLAY exists.
                         // Honor an explicit X11 desktop session instead.
+                        use winit::platform::x11::EventLoopBuilderExtX11;
                         if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("x11") {
-                            use winit::platform::x11::EventLoopBuilderExtX11;
                             builder.with_x11();
                         }
+                        // The capture event loop lives on its own thread, but winit
+                        // requires event loops to be created on the main thread by
+                        // default and panics otherwise ("Initializing the event loop
+                        // outside of the main thread is a significant cross-platform
+                        // compatibility hazard"). X11 is fine with the loop living
+                        // elsewhere, so opt in explicitly -- mirroring the Windows
+                        // branch above.
+                        builder.with_any_thread(true);
                     }
                     let event_loop = builder
                         .build()
@@ -124,8 +132,105 @@ pub fn start_capture(
         .map_err(|e| format!("failed to start capture window: {e}"))
 }
 
-// ── Internal handler ──────────────────────────────────────────────────────────
+// ── Keyboard focus (X11) ──────────────────────────────────────────────────────
 
+/// Give the overlay the X11 input focus so it receives key events (ESC to cancel).
+///
+/// On X11 an `override_redirect` window is deliberately invisible to the window
+/// manager: the WM neither positions it nor assigns it the input focus. That is
+/// exactly what we want for positioning (see `open_window`), but it means the
+/// overlay never becomes the focus window, so `KeyboardInput` never arrives and
+/// ESC silently does nothing. Windows has no such split -- its overlay is focused
+/// on creation, which is why ESC works there and not here.
+///
+/// `set_input_focus` talks to the X server directly and therefore works on
+/// unmanaged windows, which is the same call winit itself makes when it grants a
+/// window fullscreen (`set_fullscreen_hint`); it just never exposes it publicly.
+fn grab_keyboard_focus(window: &Window) {
+    #[cfg(target_os = "linux")]
+    {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use xcb::XidNew;
+
+        let Ok(handle) = window.window_handle() else {
+            tracing::warn!("[capture_window] no window handle; cannot set input focus");
+            return;
+        };
+        let RawWindowHandle::Xlib(xlib) = handle.as_raw() else {
+            // Wayland and other backends manage focus themselves; nothing to do.
+            tracing::debug!("[capture_window] non-Xlib window handle; skipping input focus");
+            return;
+        };
+
+        let Ok((conn, _screen)) = xcb::Connection::connect(None) else {
+            tracing::warn!("[capture_window] could not open X connection for input focus");
+            return;
+        };
+
+        // `send_request_checked` + `check_request` is the correct pair for void
+        // requests: the server reports errors immediately instead of the request
+        // failing silently. `check_request` requires the `Checked` cookie type.
+        let Ok(window_id) = u32::try_from(xlib.window) else {
+            tracing::warn!("[capture_window] X window id out of range; skipping input focus");
+            return;
+        };
+        let cookie = conn.send_request_checked(&xcb::x::SetInputFocus {
+            revert_to: xcb::x::InputFocus::PointerRoot,
+            // `xlib.window` is a raw XID (`u64`) coming from winit; xcb wants its
+            // own newtype. `XidNew::new` is the crate's sanctioned constructor
+            // (`XidNew::new_unchecked` would skip validity checks we want here).
+            focus: xcb::x::Window::new(window_id),
+            // XCB_CURRENT_TIME == 0; the xcb crate does not re-export it.
+            time: 0,
+        });
+        match conn.check_request(cookie) {
+            Ok(()) => tracing::debug!("[capture_window] input focus set on overlay"),
+            Err(err) => tracing::warn!("[capture_window] set_input_focus failed: {err}"),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window;
+    }
+}
+
+/// Hand keyboard focus back to the desktop after the overlay closes.
+///
+/// Pairs with [`grab_keyboard_focus`]. X11 does not automatically move focus away
+/// from a destroyed window, so without this the key events would keep targeting a
+/// dead window and the desktop would look frozen.
+fn release_keyboard_focus() {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok((conn, screen)) = xcb::Connection::connect(None) else {
+            tracing::warn!("[capture_window] could not open X connection to release focus");
+            return;
+        };
+        // Focus the root window: keyboard input goes back to the desktop instead
+        // of the overlay that is about to be destroyed.
+        let root = conn
+            .get_setup()
+            .roots()
+            .nth(screen as usize)
+            .map(|r| r.root());
+        let Some(root) = root else {
+            tracing::warn!("[capture_window] no root window to hand focus back to");
+            return;
+        };
+        let cookie = conn.send_request_checked(&xcb::x::SetInputFocus {
+            revert_to: xcb::x::InputFocus::PointerRoot,
+            focus: root,
+            // XCB_CURRENT_TIME == 0; the xcb crate does not re-export it.
+            time: 0,
+        });
+        if let Err(err) = conn.check_request(cookie) {
+            tracing::warn!("[capture_window] releasing input focus failed: {err}");
+        }
+    }
+}
+
+// ── Internal handler ──────────────────────────────────────────────────────────
 /// Possible states the handler can be in.
 enum HandlerState {
     /// No active capture; window is closed.
@@ -212,7 +317,14 @@ impl CaptureHandler {
 
         // A single borderless window over the virtual desktop keeps a drag
         // active when the pointer crosses from one monitor to another.
-        let attrs = if monitor_count == 1 {
+        //
+        // X11 is sized explicitly rather than via `Fullscreen::Borderless`: the
+        // window manager is free to ignore a fullscreen request made before the
+        // window is mapped, and winit then never delivers the `Resized` event the
+        // pre-paint below waits for, so the overlay silently never appears.
+        // Positioning the window ourselves is what the multi-monitor path already
+        // does and it matches the buffer we are about to upload exactly.
+        let attrs = if monitor_count == 1 && !cfg!(target_os = "linux") {
             let target_monitor = event_loop.available_monitors().find(|m| {
                 let pos = m.position();
                 pos.x == desktop_x && pos.y == desktop_y
@@ -226,6 +338,28 @@ impl CaptureHandler {
             attrs
                 .with_position(PhysicalPosition::new(desktop_x, desktop_y))
                 .with_inner_size(PhysicalSize::new(img_w, img_h))
+        };
+
+        // X11: the window manager must not touch this overlay at all.
+        //
+        // A normal managed window that asks for (0, 0) gets shifted down by the
+        // panel/top bar (GNOME Shell reserves the top ~32px), so the overlay
+        // started at y=32 and hung 32px off the bottom of the screen. The result
+        // was that the top bar could never be selected -- and the bottom strip of
+        // the desktop was captured even though it was off-screen. Windows does not
+        // have this problem because its capture overlay is not subject to the same
+        // tiling constraints.
+        //
+        // `override_redirect` tells X to bypass the WM entirely for this window,
+        // and the `Notification` window type marks it as an overlay so compositors
+        // neither reserve space for it nor animate it. Combined, the window lands
+        // exactly on the rectangle we asked for.
+        #[cfg(target_os = "linux")]
+        let attrs = {
+            use winit::platform::x11::{WindowAttributesExtX11, WindowType};
+            attrs
+                .with_override_redirect(true)
+                .with_x11_window_type(vec![WindowType::Notification])
         };
 
         #[cfg(target_os = "macos")]
@@ -276,6 +410,11 @@ impl CaptureHandler {
         // Pre-paint before showing the window to avoid white flash.
         // Windows does not send WM_SIZE to invisible windows, so we must resize
         // the surface ourselves using the known screenshot dimensions.
+        //
+        // A size mismatch here used to leave `shown` false forever: the window
+        // stayed hidden and no event ever arrived to retry, so the hotkey looked
+        // like it did nothing. Make the window visible regardless and let
+        // `redraw_session` do the painting once the surface is ready.
         if let HandlerState::Selecting(ref mut session) = self.state {
             if let (Some(nz_w), Some(nz_h)) = (NonZeroU32::new(img_w), NonZeroU32::new(img_h)) {
                 if session.surface.resize(nz_w, nz_h).is_ok() {
@@ -286,17 +425,34 @@ impl CaptureHandler {
                             buffer.copy_from_slice(&session.darkened_pixels);
                             let _ = buffer.present();
                             tracing::debug!("[capture_window] present done, now set_visible");
-                            session.shown = true;
-                            session.window.set_visible(true);
-                            tracing::debug!("[capture_window] set_visible done");
+                        } else {
+                            tracing::warn!(
+                                "[capture_window] pre-paint skipped: buffer {} != {}",
+                                buffer.len(),
+                                (img_w * img_h) as usize
+                            );
                         }
                     }
+                } else {
+                    tracing::warn!("[capture_window] pre-paint surface resize failed");
                 }
+            }
+            if !session.shown {
+                session.shown = true;
+                session.window.set_visible(true);
+                grab_keyboard_focus(&session.window);
+                session.window.request_redraw();
+                tracing::debug!("[capture_window] set_visible done");
             }
         }
     }
 
     fn close_window(&mut self) {
+        // Hand the keyboard back before the overlay goes away, otherwise X keeps
+        // delivering keys to a window that no longer exists and the desktop stops
+        // responding until the user clicks something. `PointerRoot` lets focus
+        // follow the pointer, which is the normal desktop behaviour.
+        release_keyboard_focus();
         // Dropping the session closes the window (Arc<Window> refcount → 0).
         self.state = HandlerState::Idle;
         self._ctx_storage = None;

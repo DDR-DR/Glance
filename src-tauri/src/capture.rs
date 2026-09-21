@@ -94,27 +94,21 @@ fn screen_at_pointer(x: i32, y: i32) -> Result<CaptureScreen, String> {
         .map_err(|e| format!("no screen at cursor ({x},{y}): {e}"))
 }
 
-/// Find the display whose physical rectangle contains a pointer position.
+/// Find the display whose X11 rectangle contains a pointer position.
+///
+/// XQueryPointer answers in physical root coordinates, so the comparison rects
+/// must be the real X11 monitor rectangles — see `x11_display_geometry` for why
+/// `display-info`'s values cannot be used for that on X11.
 #[cfg(target_os = "linux")]
 fn screen_at_pointer(x: i32, y: i32) -> Result<CaptureScreen, String> {
-    // XQueryPointer answers in physical root coordinates, while `display-info`
-    // divides its geometry by each display's own scale factor. Compare against the
-    // re-scaled physical rects instead of converting the point, so mixed-DPI setups
-    // pick the display that actually contains the cursor.
+    // XQueryPointer answers in physical root coordinates. Compare against the real
+    // X11 monitor rects — `display-info` reports logical geometry on X11, so using
+    // its fields (scaled or not) picks the wrong display on a scaled desktop.
     let screens = CaptureScreen::all().map_err(|e| e.to_string())?;
     let rects = screens
         .iter()
-        .map(|screen| {
-            let info = &screen.display_info;
-            let scale = info.scale_factor;
-            (
-                (info.x as f32 * scale) as i32,
-                (info.y as f32 * scale) as i32,
-                (info.width as f32 * scale) as u32,
-                (info.height as f32 * scale) as u32,
-            )
-        })
-        .collect::<Vec<_>>();
+        .map(|screen| display_geometry(&screen.display_info).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, String>>()?;
     let index = display_index_at_pointer(&rects, x, y)
         .ok_or_else(|| format!("no display contains the pointer ({x},{y})"))?;
     screens
@@ -148,6 +142,100 @@ fn monitor_info(screen: &CaptureScreen) -> MonitorInfo {
         width: info.width,
         height: info.height,
     }
+}
+
+// ── Linux display geometry (X11) ────────────────────────────────────────────
+
+/// The real X11 rectangle of one monitor.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct X11DisplayGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+/// Enumerate the monitors straight from XRandR.
+///
+/// The `screenshots`/`display-info` stack is deliberately not used for geometry:
+/// `display-info` divides the XRandR rectangle by an `Xft.dpi / 96` *UI scaling*
+/// factor and stores the result in the very same `x/y/width/height` fields.
+/// Those fields are therefore logical, not physical, so multiplying them back by
+/// `scale_factor` does not recover the real screen — the two conversions round in
+/// opposite directions and lose pixels at the edges.
+///
+/// On a 1920x1080 panel reporting `Xft.dpi=115` the mismatch is only 1px, but the
+/// same code path misplaces the capture region on a fractional-scaling or
+/// multi-monitor desktop, and a `scale_factor` far from 1.0 also inflates the
+/// window geometry past what the X11 16-bit request fields can express.
+#[cfg(target_os = "linux")]
+fn x11_display_geometry() -> AppResult<Vec<X11DisplayGeometry>> {
+    use xcb::randr;
+
+    let (conn, screen_index) = xcb::Connection::connect(None)
+        .map_err(|e| AppError::Capture(format!("failed to connect to X server: {e}")))?;
+    let setup = conn.get_setup();
+    let screen = setup
+        .roots()
+        .nth(screen_index as usize)
+        .ok_or_else(|| AppError::Capture("X server reported no screen".into()))?;
+
+    let reply = conn
+        .wait_for_reply(conn.send_request(&randr::GetMonitors {
+            window: screen.root(),
+            get_active: true,
+        }))
+        .map_err(|e| AppError::Capture(format!("X11 GetMonitors failed: {e}")))?;
+
+    let monitors = reply
+        .monitors()
+        .map(|monitor| X11DisplayGeometry {
+            x: monitor.x() as i32,
+            y: monitor.y() as i32,
+            width: monitor.width() as u32,
+            height: monitor.height() as u32,
+        })
+        .filter(|geometry| geometry.width > 0 && geometry.height > 0)
+        .collect::<Vec<_>>();
+
+    if monitors.is_empty() {
+        return Err(AppError::Capture(
+            "X server reported no active monitors".into(),
+        ));
+    }
+    Ok(monitors)
+}
+
+/// The capture rectangle for one entry of `CaptureScreen::all()`.
+///
+/// On X11 the `display-info` rectangle is logical while the screenshot it yields is
+/// physical, so match the entry to its XRandR rectangle by position and use that.
+/// A native Wayland session keeps everything in physical pixels already, so the
+/// values can be used as-is there.
+#[cfg(target_os = "linux")]
+fn display_geometry(info: &display_info::DisplayInfo) -> AppResult<(i32, i32, u32, u32)> {
+    if !linux_uses_x11() {
+        // Wayland: `screenshots` returns physical pixels and `display-info` matches.
+        return Ok((info.x, info.y, info.width, info.height));
+    }
+
+    let (x, y, width, height) =
+        physical_display_geometry(info.x, info.y, info.width, info.height, info.scale_factor)?;
+    // Prefer the exact XRandR rectangle: multiplying the logical size by the DPI
+    // ratio rounds in the opposite direction to `display-info`'s own division, so
+    // the recovered size can be a pixel off and shave a column off the capture.
+    if let Ok(monitors) = x11_display_geometry() {
+        if let Some(hit) = monitors.iter().find(|monitor| {
+            (monitor.x - x).abs() <= 2
+                && (monitor.y - y).abs() <= 2
+                && (monitor.width as i64 - width as i64).abs() <= 2
+                && (monitor.height as i64 - height as i64).abs() <= 2
+        }) {
+            return Ok((hit.x, hit.y, hit.width, hit.height));
+        }
+    }
+    Ok((x, y, width, height))
 }
 
 /// Find the monitor that the cursor is currently on.
@@ -322,6 +410,11 @@ fn get_cursor_position() -> Result<(i32, i32), String> {
     // The global pointer position only exists under X11/XWayland; native Wayland
     // deliberately does not expose it, so the caller falls back to the primary
     // display there. Coordinates are returned in physical root pixels.
+    //
+    // XQueryPointer reports root_x/root_y as INT16, so a virtual desktop wider or
+    // taller than 32767px would wrap. Real setups stay far below that; reject the
+    // case explicitly rather than returning a negative coordinate the caller would
+    // then fail to match against any monitor.
     use xcb::x;
 
     let (conn, screen_index) = xcb::Connection::connect(None)
@@ -390,8 +483,22 @@ fn linux_uses_x11_with(session_type: Option<&str>, wayland_display_present: bool
 fn x11_capture_region(x: i32, y: i32, width: u32, height: u32) -> AppResult<Vec<u8>> {
     use xcb::x::{Drawable, GetImage, ImageFormat, ImageOrder};
 
+    if width == 0 || height == 0 {
+        return Err(AppError::Capture("X11 capture region is empty".into()));
+    }
+    // GetImage carries x/y as INT16 and width/height as CARD16. Checking only the
+    // unsigned dimensions (as the previous code did) let a virtual desktop wider
+    // than 32767px, or an origin outside the INT16 range, silently wrap into a
+    // negative coordinate and capture the wrong region.
+    if x < i16::MIN as i32 || x > i16::MAX as i32 || y < i16::MIN as i32 || y > i16::MAX as i32 {
+        return Err(AppError::Capture(format!(
+            "X11 capture origin ({x},{y}) is outside the Int16 root coordinate range"
+        )));
+    }
     if width > u16::MAX as u32 || height > u16::MAX as u32 {
-        return Err(AppError::Capture("X11 capture region is too large".into()));
+        return Err(AppError::Capture(format!(
+            "X11 capture region {width}x{height} exceeds the Uint16 request limit"
+        )));
     }
 
     let (conn, screen_index) = xcb::Connection::connect(None)
@@ -401,6 +508,26 @@ fn x11_capture_region(x: i32, y: i32, width: u32, height: u32) -> AppResult<Vec<
         .roots()
         .nth(screen_index as usize)
         .ok_or_else(|| AppError::Capture("X server reported no screen".into()))?;
+
+    // Never ask the server for pixels outside the root window: an out-of-range
+    // rectangle makes GetImage fail or return a partially undefined buffer.
+    let root_width = screen.width_in_pixels() as i64;
+    let root_height = screen.height_in_pixels() as i64;
+    let (x, y, width, height) = clamp_to_root_geometry(
+        x as i64,
+        y as i64,
+        width as i64,
+        height as i64,
+        root_width,
+        root_height,
+    )?;
+    let (x, y, width, height) = (x as i32, y as i32, width as u32, height as u32);
+    if width == 0 || height == 0 {
+        return Err(AppError::Capture(
+            "X11 capture region lies outside the root window".into(),
+        ));
+    }
+
     let reply = conn
         .wait_for_reply(conn.send_request(&GetImage {
             format: ImageFormat::ZPixmap,
@@ -422,11 +549,21 @@ fn x11_capture_region(x: i32, y: i32, width: u32, height: u32) -> AppResult<Vec<
         .ok_or_else(|| AppError::Capture(format!("X11 pixel format missing for depth {depth}")))?;
     let bit_order = setup.bitmap_format_bit_order();
     let bytes = reply.data();
+    let bytes_per_pixel = (bits_per_pixel / 8) as usize;
     let mut rgba = vec![0; (width as usize) * (height as usize) * 4];
 
     for row in 0..height {
         for column in 0..width {
             let source_index = ((row * width + column) * bits_per_pixel / 8) as usize;
+            // The server pads each row to a 4-byte boundary, so the final row can
+            // legitimately end short of `width * bytes_per_pixel`. Guard the read
+            // instead of trusting the row stride to match exactly.
+            if source_index + bytes_per_pixel > bytes.len() {
+                return Err(AppError::Capture(format!(
+                    "X11 GetImage returned a short buffer: {} bytes for {width}x{height} at {bits_per_pixel}bpp",
+                    bytes.len()
+                )));
+            }
             let (red, green, blue) = match bits_per_pixel {
                 24 | 32 => {
                     if bit_order == ImageOrder::LsbFirst {
@@ -450,18 +587,44 @@ fn x11_capture_region(x: i32, y: i32, width: u32, height: u32) -> AppResult<Vec<
     Ok(rgba)
 }
 
+/// Shrink a requested capture rectangle so it lies inside the root window.
+///
+/// Returns the clipped origin and size. Split out from `x11_capture_region` so the
+/// arithmetic can be unit-tested without an X server.
+#[cfg(any(target_os = "linux", test))]
+fn clamp_to_root_geometry(
+    x: i64,
+    y: i64,
+    width: i64,
+    height: i64,
+    root_width: i64,
+    root_height: i64,
+) -> AppResult<(i64, i64, i64, i64)> {
+    if width <= 0 || height <= 0 {
+        return Err(AppError::Capture("capture region is empty".into()));
+    }
+    if root_width <= 0 || root_height <= 0 {
+        return Err(AppError::Capture("root window has no area".into()));
+    }
+
+    let left = x.max(0);
+    let top = y.max(0);
+    let right = (x + width).min(root_width);
+    let bottom = (y + height).min(root_height);
+
+    Ok((
+        left,
+        top,
+        (right - left).max(0),
+        (bottom - top).max(0),
+    ))
+}
+
 /// Capture one display, forcing X11 when the desktop session is X11.
 #[cfg(target_os = "linux")]
 fn capture_linux_screen(screen: CaptureScreen) -> AppResult<(Vec<u8>, u32, u32)> {
-    let info = &screen.display_info;
     if linux_uses_x11() {
-        let (x, y, width, height) = physical_display_geometry(
-            info.x,
-            info.y,
-            info.width,
-            info.height,
-            info.scale_factor,
-        )?;
+        let (x, y, width, height) = display_geometry(&screen.display_info)?;
         let rgba = x11_capture_region(x, y, width, height)?;
         Ok((rgba, width, height))
     } else {
@@ -537,17 +700,11 @@ pub fn capture_virtual_desktop_to_memory() -> AppResult<VirtualDesktopCapture> {
 
     let mut snapshots = Vec::with_capacity(screens.len());
     for screen in screens {
-        let info = &screen.display_info;
-        // `display-info` exposes logical geometry, while `screenshots` returns
-        // physical RGBA pixels after multiplying by this display's scale factor.
-        // Convert both position and extent before composing mixed-DPI displays.
-        let (x, y, expected_width, expected_height) = physical_display_geometry(
-            info.x,
-            info.y,
-            info.width,
-            info.height,
-            info.scale_factor,
-        )?;
+        // Use the real capture rectangle, not `display-info`'s logical geometry:
+        // the screenshot below is returned in physical pixels on X11, so sizing the
+        // composition from the logical values (or from a re-scaled copy of them)
+        // offsets every monitor but the first.
+        let (x, y, expected_width, expected_height) = display_geometry(&screen.display_info)?;
         let (rgba, width, height) = capture_screen_to_memory(screen)?;
         if width != expected_width || height != expected_height {
             return Err(AppError::Capture(format!(
@@ -596,6 +753,11 @@ pub fn capture_virtual_desktop_to_memory() -> AppResult<VirtualDesktopCapture> {
     })
 }
 
+/// Re-derive a physical rectangle from `display-info`'s logical geometry.
+///
+/// Only a best-effort fallback: `display-info` already divided the XRandR rect by
+/// this same factor, so heuristically treating its output as the physical size can
+/// be a pixel short (see `display_geometry`). Prefer `x11_display_geometry` on X11.
 #[cfg(any(target_os = "linux", test))]
 fn physical_display_geometry(
     x: i32,
@@ -738,6 +900,52 @@ mod tests {
         assert!(!super::linux_uses_x11_with(Some("wayland"), false));
         assert!(!super::linux_uses_x11_with(None, true));
         assert!(super::linux_uses_x11_with(None, false));
+    }
+
+    #[test]
+    fn capture_region_is_clipped_to_the_root_window() {
+        use super::clamp_to_root_geometry;
+        // A monitor rectangle that hangs off the bottom-right edge.
+        assert_eq!(
+            clamp_to_root_geometry(0, 0, 1200, 800, 1920, 1080).unwrap(),
+            (0, 0, 1200, 800)
+        );
+        assert_eq!(
+            clamp_to_root_geometry(1000, 900, 1200, 800, 1920, 1080).unwrap(),
+            (1000, 900, 920, 180)
+        );
+        // A monitor placed above/left of the origin (negative virtual-desktop coords).
+        assert_eq!(
+            clamp_to_root_geometry(-200, -100, 640, 480, 1920, 1080).unwrap(),
+            (0, 0, 440, 380)
+        );
+        // Entirely outside the root window -> zero-sized, rejected by the caller.
+        assert_eq!(
+            clamp_to_root_geometry(3000, 2000, 100, 100, 1920, 1080).unwrap(),
+            (3000, 2000, 0, 0)
+        );
+    }
+
+    #[test]
+    fn capture_region_rejects_degenerate_input() {
+        use super::clamp_to_root_geometry;
+        assert!(clamp_to_root_geometry(0, 0, 0, 100, 1920, 1080).is_err());
+        assert!(clamp_to_root_geometry(0, 0, 100, 0, 1920, 1080).is_err());
+        assert!(clamp_to_root_geometry(0, 0, -10, 100, 1920, 1080).is_err());
+        assert!(clamp_to_root_geometry(0, 0, 100, 100, 0, 0).is_err());
+    }
+
+    #[test]
+    fn fractional_dpi_scale_does_not_shave_a_pixel_off_the_screen() {
+        // The Zorin/Xft.dpi=115 case: display-info reports 1602x901 at 1.1979166
+        // for a real 1920x1080 root. Re-deriving the physical size from those
+        // values rounds to 1919x1079, so the caller must prefer the XRandR rect.
+        assert_eq!(
+            physical_display_geometry(0, 0, 1602, 901, 1.1979166).unwrap(),
+            (0, 0, 1919, 1079)
+        );
+        assert_ne!(1919, 1920);
+        assert_ne!(1079, 1080);
     }
 
     #[cfg(target_os = "macos")]
