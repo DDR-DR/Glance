@@ -172,12 +172,16 @@ body.capture-preparing *::after {
 }
 
 /* Settings panel */
+/* flex: 0 1 auto = size to content, never stretch. When the window is
+   maximized the extra vertical space goes to the translation area above,
+   not here (previously flex:1 stretched the panel into a huge blank area).
+   Shrink is still allowed so over-tall content scrolls inside the panel. */
 .settings-panel {
   background: var(--block-bg);
   border-radius: var(--radius-xl);
   padding: 14px 16px;
   box-shadow: 0 2px 8px rgba(0,0,0,0.02);
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-height: 0;
   /* Scroll with the wheel when content overflows, but never show a scrollbar
      (its appearance/disappearance during the resize caused a flash). */
@@ -254,9 +258,9 @@ body.capture-preparing *::after {
 
 /* ── Text block: left input + right output ── */
 /* The translation area fills the window when settings are collapsed. When the
-   settings panel is visible (window grows), its height is capped so it stays
-   the same size and the extra vertical space is absorbed by the settings
-   panel below. */
+   settings panel is visible it keeps a 200px baseline and absorbs any extra
+   vertical space (e.g. maximized window) — the settings panel below stays
+   content-sized instead of stretching into blank space. */
 .text-block {
   display: flex;
   flex-direction: row;
@@ -266,8 +270,8 @@ body.capture-preparing *::after {
   overflow: hidden;
 }
 .bento-app.settings-open .text-block {
-  flex: 0 0 auto;
-  height: 200px;
+  flex: 1 1 auto;
+  min-height: 200px;
 }
 .text-col {
   flex: 1 1 0;
