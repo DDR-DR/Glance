@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -36,6 +37,12 @@ pub struct SharedState {
     pub capture_session: Arc<RwLock<Option<ActiveCaptureSession>>>,
     pub capture_mode: Arc<RwLock<CaptureMode>>,
     pub overlay_payload: Arc<RwLock<Option<OverlayPayload>>>,
+    /// Logical main-window visibility. Windows `is_visible()` is unreliable
+    /// around global shortcuts (focus is stolen before the handler runs).
+    pub main_window_shown: Arc<AtomicBool>,
+    /// Latest frontend text request. Older requests may still finish at the
+    /// network layer, but they must not populate history or cache afterward.
+    pub latest_text_request: Arc<AtomicU64>,
 }
 
 impl SharedState {
@@ -56,6 +63,24 @@ impl SharedState {
             capture_session: Arc::new(RwLock::new(None)),
             capture_mode: Arc::new(RwLock::new(CaptureMode::default())),
             overlay_payload: Arc::new(RwLock::new(None)),
+            main_window_shown: Arc::new(AtomicBool::new(false)),
+            latest_text_request: Arc::new(AtomicU64::new(0)),
         }
+    }
+    pub fn set_main_window_shown(&self, shown: bool) {
+        self.main_window_shown.store(shown, Ordering::SeqCst);
+    }
+
+    pub fn main_window_shown(&self) -> bool {
+        self.main_window_shown.load(Ordering::SeqCst)
+    }
+
+    pub fn begin_text_request(&self, request_id: u64) {
+        self.latest_text_request
+            .fetch_max(request_id, Ordering::SeqCst);
+    }
+
+    pub fn is_latest_text_request(&self, request_id: u64) -> bool {
+        self.latest_text_request.load(Ordering::SeqCst) == request_id
     }
 }

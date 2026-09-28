@@ -5,6 +5,7 @@ mod app_state;
 mod bing_translate;
 mod builtin_translate;
 mod capture;
+mod capture_hotkey;
 mod capture_window;
 mod commands;
 mod config;
@@ -26,10 +27,11 @@ use app_state::SharedState;
 use bing_translate::BingTranslateClient;
 use builtin_translate::BuiltinTranslateClient;
 use commands::{
-    begin_capture, begin_copy_capture, cancel_capture, capture_debug_log, clear_history,
-    clear_text_history, clear_translate_cache, close_overlay, hide_window, list_history,
-    list_text_history, load_capture_payload, load_overlay_payload, load_settings,
-    resize_main_window, save_settings, show_overlay, submit_capture_selection, translate_text,
+    begin_capture, begin_copy_capture, cancel_capture, capture_debug_log, check_update,
+    clear_history, clear_text_history, clear_translate_cache, close_overlay, hide_window,
+    list_history, list_text_history, load_capture_payload, load_overlay_payload, load_settings,
+    open_release_page, resize_main_window, save_settings, set_pin_on_top, show_overlay,
+    start_capture_translate, submit_capture_selection, translate_text,
 };
 use config::ConfigStore;
 use llm_translate::LlmTranslateClient;
@@ -49,8 +51,7 @@ use translate_engine::TextTranslator;
 /// Release builds have no console attached (`windows_subsystem = "windows"`),
 /// so without a file the logs would be lost entirely on Windows.
 fn setup_logging() {
-    let filter =
-        EnvFilter::from_default_env().add_directive("info".parse().unwrap());
+    let filter = EnvFilter::from_default_env().add_directive("info".parse().unwrap());
 
     if let Some(dir) = dirs_of_log_dir() {
         let _ = std::fs::create_dir_all(&dir);
@@ -154,6 +155,7 @@ fn main() {
                     commands::apply_popup_shortcut(&app_handle, popup);
                 }
                 commands::apply_copy_hotkey(&app_handle, &settings.copy_hotkey);
+                commands::apply_pin_on_top(&app_handle, settings.pin_on_top);
 
                 // ── HTTP clients ────────────────────────────────────────────────
                 // General client for Youdao
@@ -218,8 +220,9 @@ fn main() {
             let icon = Image::from_bytes(include_bytes!("../icons/icon.png"))?;
 
             let show = MenuItemBuilder::with_id("show", "显示窗口").build(app)?;
+            let capture_translate = MenuItemBuilder::with_id("capture_translate", "截图翻译").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "退出").build(app)?;
-            let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
+            let menu = MenuBuilder::new(app).items(&[&show, &capture_translate, &quit]).build()?;
 
             TrayIconBuilder::new()
                 .icon(icon)
@@ -228,6 +231,9 @@ fn main() {
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => {
                         show_main_window(app);
+                    }
+                    "capture_translate" => {
+                        start_capture_translate(app);
                     }
                     "quit" => {
                         app.exit(0);
@@ -284,8 +290,11 @@ fn main() {
             close_overlay,
             translate_text,
             resize_main_window,
+            set_pin_on_top,
             hide_window,
-            capture_debug_log
+            capture_debug_log,
+            check_update,
+            open_release_page
         ])
         .build(tauri::generate_context!())
         .expect("failed to build tauri app");
@@ -307,6 +316,7 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = w.show();
         let _ = w.set_focus();
     }
+    commands::note_main_window_shown(app, true);
 }
 
 #[cfg(target_os = "macos")]
@@ -315,6 +325,7 @@ fn hide_main_window_to_background(app: &tauri::AppHandle) {
         let _ = w.hide();
     }
     let _ = app.set_dock_visibility(false);
+    commands::note_main_window_shown(app, false);
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -322,4 +333,5 @@ fn hide_main_window_to_background(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.hide();
     }
+    commands::note_main_window_shown(app, false);
 }

@@ -56,11 +56,14 @@ impl ConfigStore {
         self.ensure().await?;
         let bytes = fs::read(&self.settings_file).await?;
         let mut settings: TranslatorSettings = serde_json::from_slice(&bytes)?;
-        // API key is stored encrypted on Windows; decrypt on load.
+        // Load the API key from DPAPI (Windows), Keychain (macOS), or the
+        // legacy plaintext field on platforms without a secret store.
         let stored_key = settings.llm_config.api_key.clone();
-        let legacy_plaintext = !stored_key.is_empty() && !stored_key.starts_with("enc:v1:");
+        let legacy_plaintext = !stored_key.is_empty()
+            && !stored_key.starts_with("enc:v1:")
+            && stored_key != "keychain:v1";
         settings.llm_config.api_key = crate::secure::decrypt(&stored_key);
-        // One-time migration: persist the legacy plaintext key encrypted.
+        // One-time migration: move legacy plaintext into the platform store.
         if legacy_plaintext {
             let _ = self.save_settings(&settings).await;
         }
@@ -70,9 +73,8 @@ impl ConfigStore {
     pub async fn save_settings(&self, settings: &TranslatorSettings) -> AppResult<()> {
         self.ensure().await?;
         let mut stored = settings.clone();
-        // Encrypt the API key at rest. `encrypt` falls back to plaintext when
-        // DPAPI is unavailable, and re-encrypting an already-encrypted value is
-        // a no-op (it is recognized by its prefix).
+        // Protect the API key at rest. Windows uses DPAPI and macOS stores the
+        // value in Login Keychain. Other platforms keep the legacy field.
         stored.llm_config.api_key = crate::secure::encrypt(&stored.llm_config.api_key);
         let bytes = serde_json::to_vec_pretty(&stored)?;
         fs::write(&self.settings_file, bytes).await?;

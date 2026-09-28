@@ -123,8 +123,6 @@ pub struct TranslatorSettings {
     pub close_on_outside_click: bool,
     #[serde(default)]
     pub autostart: bool,
-    #[serde(default = "default_auto_translate")]
-    pub auto_translate: bool,
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
     #[serde(default = "default_copy_hotkey")]
@@ -139,10 +137,21 @@ pub struct TranslatorSettings {
     pub proxy_mode: ProxyMode,
     #[serde(default)]
     pub custom_proxy: String,
+    /// Allow failed translations to be sent to a different provider.
+    /// Disabled by default so content never crosses providers unexpectedly.
+    #[serde(default)]
+    pub allow_fallback_engine: bool,
+    /// Store full text translation history on disk. Opt-in because entries may
+    /// contain sensitive source and translated text.
+    #[serde(default)]
+    pub record_text_history: bool,
     #[serde(default = "default_history_limit")]
     pub history_limit: usize,
     #[serde(default = "default_cache_size")]
     pub cache_size: usize,
+    /// 主窗口置顶（横栏上的图钉按钮）。
+    #[serde(default)]
+    pub pin_on_top: bool,
 }
 
 fn default_history_limit() -> usize {
@@ -189,7 +198,6 @@ impl Default for TranslatorSettings {
             overlay_font_scale: 1.0,
             close_on_outside_click: true,
             autostart: false,
-            auto_translate: default_auto_translate(),
             hotkey: default_hotkey(),
             copy_hotkey: default_copy_hotkey(),
             text_translate_engine: TextTranslateEngine::default(),
@@ -197,8 +205,11 @@ impl Default for TranslatorSettings {
             popup_shortcut: None,
             proxy_mode: ProxyMode::default(),
             custom_proxy: String::new(),
+            allow_fallback_engine: false,
+            record_text_history: false,
             history_limit: default_history_limit(),
             cache_size: default_cache_size(),
+            pin_on_top: false,
         }
     }
 }
@@ -235,10 +246,6 @@ fn default_hotkey() -> String {
 
 fn default_copy_hotkey() -> String {
     "CommandOrControl+Shift+C".to_string()
-}
-
-fn default_auto_translate() -> bool {
-    true
 }
 
 fn default_capture_to_lang() -> String {
@@ -428,4 +435,17 @@ mod tests {
 
         assert_eq!(item.source_side, TextSourceSide::Left);
     }
+}
+
+/// 一次更新检查的结果。latest 已过白名单（去 v 前缀，只留 0-9a-z.-+），谁更新交给
+/// 前端判（ui/version.mjs 里有单测），Rust 这边不做版本比较。
+/// 这里刻意没有 url 字段：要打开的地址是 commands.rs 里的常量，不让一个从前端
+/// 绕回来的字符串再去决定浏览器打开哪儿。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    pub latest: String,
+    pub current: String,
+    pub notes: String,
+    pub published_at: String,
 }

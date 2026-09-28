@@ -19,9 +19,9 @@ pub struct TranslationOutcome {
     pub engine: TextTranslateEngine,
 }
 
-/// How many times a transient failure (timeout, 5xx, 429, network) retries the
-/// primary engine before falling back.
-const MAX_RETRIES: u32 = 2;
+/// Built-in engines are cheap to retry once. LLM calls are not retried
+/// automatically because a second 60-second request can duplicate cost.
+const BUILTIN_MAX_RETRIES: u32 = 1;
 const RETRY_BASE_DELAY_MS: u64 = 300;
 
 impl TextTranslator {
@@ -45,16 +45,22 @@ impl TextTranslator {
         engine: TextTranslateEngine,
         llm_config: &LlmConfig,
         proxy: Option<&str>,
+        allow_fallback: bool,
     ) -> AppResult<TranslationOutcome> {
         // Retry transient failures on the primary engine with a small backoff.
         let mut attempt = 0;
+        let max_retries = if engine == TextTranslateEngine::Llm {
+            0
+        } else {
+            BUILTIN_MAX_RETRIES
+        };
         let primary_err = loop {
             match self
                 .translate_once(text, from, to, engine, llm_config, proxy)
                 .await
             {
                 Ok(result) => return Ok(TranslationOutcome { result, engine }),
-                Err(err) if err.is_transient() && attempt < MAX_RETRIES => {
+                Err(err) if err.is_transient() && attempt < max_retries => {
                     attempt += 1;
                     tracing::warn!(
                         "engine {engine:?} transient failure (attempt {attempt}): {err}"
@@ -68,20 +74,24 @@ impl TextTranslator {
             }
         };
 
-        // Retries exhausted: degrade to a free fallback engine so the user
-        // still gets a result. Never fall back *to* the LLM (it costs money).
-        if let Some(fallback) = fallback_engine(engine) {
-            tracing::warn!("engine {engine:?} failed, falling back to {fallback:?}: {primary_err}");
-            let mut result = self
-                .translate_once(text, from, to, fallback, llm_config, proxy)
-                .await?;
-            result
-                .alternatives
-                .push("⚠ 主引擎不可用，已自动使用备用引擎".to_string());
-            return Ok(TranslationOutcome {
-                result,
-                engine: fallback,
-            });
+        // Cross-provider fallback is opt-in because translated text may be
+        // sensitive. Never fall back *to* the LLM (it costs money).
+        if allow_fallback {
+            if let Some(fallback) = fallback_engine(engine) {
+                tracing::warn!(
+                    "engine {engine:?} failed, falling back to {fallback:?}: {primary_err}"
+                );
+                let mut result = self
+                    .translate_once(text, from, to, fallback, llm_config, proxy)
+                    .await?;
+                result
+                    .alternatives
+                    .push("⚠ 主引擎不可用，已自动使用备用引擎".to_string());
+                return Ok(TranslationOutcome {
+                    result,
+                    engine: fallback,
+                });
+            }
         }
         Err(primary_err)
     }

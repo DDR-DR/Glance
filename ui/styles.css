@@ -101,7 +101,20 @@ body.capture-preparing *::after {
   border-radius: 6px;
 }
 .lang-pill select:hover { background: rgba(0,0,0,0.04); }
-.lang-icon { color: #A1A1AA; font-size: 12px; }
+.lang-swap {
+  color: #A1A1AA;
+  font-size: 14px;
+  line-height: 1;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+.lang-swap:hover {
+  background: rgba(0,0,0,0.04);
+  color: var(--text-main);
+}
 
 /* Toggle */
 .toggle {
@@ -159,12 +172,16 @@ body.capture-preparing *::after {
 }
 
 /* Settings panel */
+/* flex: 0 1 auto = size to content, never stretch. When the window is
+   maximized the extra vertical space goes to the translation area above,
+   not here (previously flex:1 stretched the panel into a huge blank area).
+   Shrink is still allowed so over-tall content scrolls inside the panel. */
 .settings-panel {
   background: var(--block-bg);
   border-radius: var(--radius-xl);
   padding: 14px 16px;
   box-shadow: 0 2px 8px rgba(0,0,0,0.02);
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-height: 0;
   /* Scroll with the wheel when content overflows, but never show a scrollbar
      (its appearance/disappearance during the resize caused a flash). */
@@ -233,11 +250,44 @@ body.capture-preparing *::after {
 .settings-btn:hover { color: var(--text-main); background: rgba(0,0,0,0.04); }
 .settings-btn.open { color: var(--accent); }
 
+.pin-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  cursor: pointer;
+  line-height: 1;
+  color: var(--text-sub);
+  padding: 4px;
+  border-radius: 6px;
+  transition: all 0.15s;
+  /* 斜过来 = 图钉被拔起来了（未置顶）；摆正 + 填充 = 钉住（置顶）。
+     图标本身画成正立的，所以这里的角度就是用户实际看到的角度。 */
+  transform: rotate(-45deg);
+}
+.pin-btn svg { display: block; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linejoin: round; }
+.pin-btn:hover { color: var(--text-main); background: rgba(0,0,0,0.04); }
+.pin-btn.on { color: var(--accent); transform: rotate(0deg); }
+.pin-btn.on svg { fill: currentColor; stroke: none; }
+
+/* ── Collapse: 窗口拉到只剩横栏时先收掉输入/输出 ── */
+/* 横栏本身 flex-shrink:0，最小高度就是它 + 上下 padding；正文一矮到没法用就
+   整个收起来，而不是让用户拖不动。设置面板展开时不收（那时窗口会被撑开）。 */
+@media (max-height: 176px) {
+  .bento-app:not(.settings-open) .text-block { display: none; }
+}
+/* 横栏里的东西在窄窗口下按重要性依次让位：标题、按钮文字。 */
+@media (max-width: 600px) {
+  .header-block .app-title { display: none; }
+  .header-block .capture-btn .btn-label { display: none; }
+}
+
 /* ── Text block: left input + right output ── */
 /* The translation area fills the window when settings are collapsed. When the
-   settings panel is visible (window grows), its height is capped so it stays
-   the same size and the extra vertical space is absorbed by the settings
-   panel below. */
+   settings panel is visible it keeps a 200px baseline and absorbs any extra
+   vertical space (e.g. maximized window) — the settings panel below stays
+   content-sized instead of stretching into blank space. */
 .text-block {
   display: flex;
   flex-direction: row;
@@ -247,8 +297,8 @@ body.capture-preparing *::after {
   overflow: hidden;
 }
 .bento-app.settings-open .text-block {
-  flex: 0 0 auto;
-  height: 200px;
+  flex: 1 1 auto;
+  min-height: 200px;
 }
 .text-col {
   flex: 1 1 0;
@@ -484,6 +534,31 @@ body.capture-preparing *::after {
   font-weight: 400;
   color: var(--text-sub);
 }
+/* 更新行：当前版本 + 一个按钮（查到新版时变成「打开下载页」）。 */
+.update-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.update-btn {
+  background: none;
+  border: 1px solid var(--block-bg);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-main);
+  padding: 3px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+.update-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.update-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
 .settings-textarea {
   width: 100%;
   margin-left: 0;
@@ -664,12 +739,14 @@ body[data-mode="capture"] {
   background: #000;
   overflow: hidden;
   user-select: none;
+  touch-action: none;
 }
 .capture-root {
   position: fixed;
   inset: 0;
   overflow: hidden;
   cursor: crosshair;
+  touch-action: none;
 }
 .capture-screen {
   position: absolute;

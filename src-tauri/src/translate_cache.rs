@@ -76,8 +76,11 @@ impl TranslateCache {
         if text.len() > MAX_CACHED_TEXT_LEN {
             return None;
         }
-        let cache_key = make_key(text, from, to, engine, variant);
         let mut state = self.inner.lock().await;
+        if state.max_entries == 0 {
+            return None;
+        }
+        let cache_key = make_key(text, from, to, engine, variant);
         let now = now_secs();
         let mut hit = false;
         if let Some(entry) = state.entries.iter_mut().find(|e| e.key == cache_key) {
@@ -118,8 +121,11 @@ impl TranslateCache {
         if result.translated_text.trim() == text.trim() {
             return;
         }
-        let cache_key = make_key(text, from, to, engine, variant);
         let mut state = self.inner.lock().await;
+        if state.max_entries == 0 {
+            return;
+        }
+        let cache_key = make_key(text, from, to, engine, variant);
         if let Some(entry) = state.entries.iter_mut().find(|e| e.key == cache_key) {
             entry.result = result;
             entry.last_used = now_secs();
@@ -146,7 +152,6 @@ impl TranslateCache {
 
     pub async fn set_max_entries(&self, max: usize) {
         let mut state = self.inner.lock().await;
-        let max = max.max(1);
         state.max_entries = max;
         while state.entries.len() > max {
             let mut oldest = 0usize;
@@ -245,6 +250,27 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn zero_limit_disables_and_clears_cache() {
+        let cache = TranslateCache::new(PathBuf::from("unused-test-cache.json"));
+        let result = TextTranslationResult {
+            translated_text: "你好".to_string(),
+            from_lang_detected: "en".to_string(),
+            alternatives: Vec::new(),
+        };
+        cache
+            .insert("hello", "en", "zh-CHS", "bing", "", result)
+            .await;
+        assert_eq!(cache.entry_count().await, 1);
+
+        cache.set_max_entries(0).await;
+        assert_eq!(cache.entry_count().await, 0);
+        assert!(cache
+            .get("hello", "en", "zh-CHS", "bing", "")
+            .await
+            .is_none());
+    }
 
     #[test]
     fn llm_configuration_changes_invalidate_cache_variant() {

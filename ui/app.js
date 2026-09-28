@@ -1,4 +1,7 @@
 import { focusTextInputIfAllowed } from "./focus-helpers.mjs";
+import { shouldTranslateOnInput, shouldTranslateOnEnter } from "./ime-guards.mjs";
+import { canRetranslateNow } from "./retranslate.mjs";
+import { isNewerVersion } from "./version.mjs";
 
 const LANGUAGES = [
   { value: "auto", label: "自动检测" },
@@ -113,6 +116,21 @@ function presetComboCurrent() {
 // Reading those would make the window grow a little on every engine switch.
 // Instead we measure the panel's *content* (its `.settings-section` children),
 // which is unaffected by how tall the panel is stretched.
+function applyPin() {
+  const pinned = Boolean(state.settings && state.settings.pinOnTop);
+  const btn = document.querySelector("#pin-btn");
+  if (btn) {
+    btn.classList.toggle("on", pinned);
+    btn.setAttribute("aria-pressed", pinned ? "true" : "false");
+    btn.title = pinned ? "取消置顶" : "置顶窗口";
+    // 按钮里现在只有图标没有文字，辅助技术只能读到 label，所以状态变了要一起改。
+    btn.setAttribute("aria-label", pinned ? "取消置顶" : "置顶窗口");
+  }
+  // 置顶状态是跟着设置存的，所以每次渲染都把它回写到窗口上：换设备/手改过
+  // settings.json 之后，按钮和窗口不会各说各话。
+  invoke?.("set_pin_on_top", { pinned }).catch(() => {});
+}
+
 function settingsHeight() {
   const appEl = document.querySelector(".bento-app");
   const header = document.querySelector(".header-block");
@@ -165,6 +183,10 @@ function clearTranslationTimer() {
   debounceTimer = null;
 }
 
+function cancelPendingTranslation() {
+  clearTranslationTimer();
+}
+
 function invalidateTranslation() {
   clearTranslationTimer();
   translateSeq++;
@@ -191,12 +213,6 @@ function isCurrentTranslation(seq, side, contextKey) {
     translationContextKey(side) === contextKey;
 }
 
-function translationSettingsChanged() {
-  invalidateTranslation();
-  state.textLoading = false;
-  updateSides();
-}
-
 function debouncedTranslate(side) {
   invalidateTranslation();
   const scheduledSeq = translateSeq;
@@ -216,6 +232,48 @@ function debouncedTranslate(side) {
     debounceTimer = null;
     if (scheduledSeq === translateSeq) translateText(side);
   }, 500);
+}
+
+// Changing a language or engine select leaves the *previous* result on screen,
+// which used to mean one more Enter press to see the new one. Re-run the
+// translation on the change instead. `awaitPersisted` matters for the engine:
+// translate_text gets the languages as arguments, but the engine itself is read
+// from the saved settings by the Rust side, so the write has to land first.
+async function retranslateNow({ awaitPersisted = false } = {}) {
+  cancelPendingTranslation();
+  const s = state.settings;
+  if (!s) return;
+
+  let side = state.activeSide === "right" ? "right" : "left";
+  // “自动检测”只能作为源语言。设置变化后，如果当前输入侧变成了
+  // 目标为 auto 的无效方向，就回到仍然可翻译的另一侧。
+  if (side === "right" && s.fromLang === "auto") side = "left";
+  if (side === "left" && s.toLang === "auto") side = "right";
+  state.activeSide = side;
+  const inputText = side === "right" ? state.rightText : state.leftText;
+
+  if (awaitPersisted) {
+    try {
+      await saveSettings();
+    } catch (err) {
+      // The backend still has the old configuration, so do not issue a request
+      // that would appear successful while using stale settings.
+      translateSeq++;
+      return;
+    }
+  }
+
+  if (!canRetranslateNow({
+    inputText,
+    engine: s.textTranslateEngine,
+    llmApiKey: s.llmConfig && s.llmConfig.apiKey,
+  })) {
+    // Keep the previous readable result, but prevent an older request from
+    // committing after the user switched to an option that cannot translate.
+    translateSeq++;
+    return;
+  }
+  await translateText(side);
 }
 
 const app = document.querySelector("#app");
@@ -279,8 +337,11 @@ function defaultSettings() {
     popupShortcut: null,
     proxyMode: "system",
     customProxy: "",
+    allowFallbackEngine: false,
+    recordTextHistory: false,
     historyLimit: 200,
-    cacheSize: 200
+    cacheSize: 200,
+    pinOnTop: false
   };
 }
 
@@ -305,6 +366,39 @@ function handlePaste(side, input) {
     state.activeSide = side;
     translateText(side);
   }, 0);
+}
+
+function bindTranslationInput(input, side) {
+  let composing = false;
+  const writeState = () => {
+    if (side === "right") state.rightText = input.value;
+    else state.leftText = input.value;
+    state.activeSide = side;
+  };
+
+  input.addEventListener("compositionstart", () => { composing = true; });
+  input.addEventListener("compositionend", () => {
+    composing = false;
+    writeState();
+    debouncedTranslate(side);
+  });
+  input.addEventListener("input", event => {
+    writeState();
+    if (!shouldTranslateOnInput(event, composing)) return;
+    debouncedTranslate(side);
+  });
+  input.addEventListener("keydown", event => {
+    if (!shouldTranslateOnEnter(event, composing)) return;
+    event.preventDefault();
+    writeState();
+    translateText(side);
+  });
+  input.addEventListener("paste", () => handlePaste(side, input));
+}
+
+async function settingsChangedAndRetranslate() {
+  updateSides();
+  await retranslateNow({ awaitPersisted: true });
 }
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -334,8 +428,31 @@ function languageOptions(current, autoDisabled, hideAuto) {
 function refreshLangSelects() {
   const from = document.querySelector("#from-lang");
   const to = document.querySelector("#to-lang");
-  if (from) from.innerHTML = languageOptions(from.value, state.settings?.toLang === "auto");
-  if (to) to.innerHTML = languageOptions(to.value, state.settings?.fromLang === "auto");
+  if (from) from.innerHTML = languageOptions(state.settings?.fromLang, state.settings?.toLang === "auto");
+  if (to) to.innerHTML = languageOptions(state.settings?.toLang, state.settings?.fromLang === "auto");
+}
+
+function fallbackTargetLang(fromLang) {
+  const detected = state.detectedLang;
+  if (detected && detected !== "auto" && detected !== fromLang) return detected;
+  return fromLang === "zh-CHS" ? "en" : "zh-CHS";
+}
+
+function swapLanguages() {
+  if (!state.settings) return;
+  const from = state.settings.fromLang;
+  const to = state.settings.toLang;
+  const nextFrom = to === "auto" ? fallbackTargetLang(from) : to;
+  const nextTo = from === "auto" ? fallbackTargetLang(nextFrom) : from;
+  state.settings.fromLang = nextFrom;
+  state.settings.toLang = nextTo;
+  [state.leftText, state.rightText] = [state.rightText, state.leftText];
+  state.activeSide = "left";
+  refreshLangSelects();
+  updateSides();
+  // The engine reads its configuration from persisted settings; keep the same
+  // ordering for language swaps so the UI and backend never drift apart.
+  retranslateNow({ awaitPersisted: true }).catch(() => {});
 }
 
 function shortcutKeysHtml(hk) {
@@ -351,7 +468,8 @@ function renderFatal(msg) {
 
 async function ensureTauriApi() {
   if (invoke && listen) return;
-  for (let i = 0; i < 100; i++) {
+  const attempts = (window.__TAURI__ || window.__TAURI_INTERNALS__) ? 100 : 5;
+  for (let i = 0; i < attempts; i++) {
     const t = window.__TAURI__;
     const ti = window.__TAURI_INTERNALS__;
     const nextInvoke = t?.core?.invoke || ti?.invoke;
@@ -363,11 +481,120 @@ async function ensureTauriApi() {
     }
     await delay(20);
   }
-  throw new Error("Tauri runtime unavailable");
+  // Browser preview: keep the UI usable when the Tauri runtime is absent.
+  invoke = async (cmd, args) => {
+    if (cmd === "load_settings") return defaultSettings();
+    if (cmd === "save_settings") return args?.settings || defaultSettings();
+    if (cmd === "list_history" || cmd === "list_text_history") return [];
+    if (cmd === "clear_translate_cache") return 0;
+    if (cmd === "check_update") return null;
+    if ([
+      "resize_main_window",
+      "hide_window",
+      "close_overlay",
+      "set_pin_on_top",
+      "clear_text_history",
+      "open_release_page",
+    ].includes(cmd)) return null;
+    throw new Error("当前是浏览器预览，截图/翻译需要桌面应用");
+  };
+  listen = async () => () => {};
 }
 
 async function loadSettings() { state.settings = await invoke("load_settings"); }
 async function saveSettings() { state.settings = await invoke("save_settings", { settings: state.settings }); }
+
+// 更新检查：只查 GitHub Releases 的最新 tag，比当前版本新才把按钮换成「打开下载页」。
+// 版本比较在 ui/version.mjs（有单测）。打开动作走 Rust 的 open_release_page，它不收
+// 参数、要打开的地址是 Rust 侧的常量，前端这里只负责说「打开」。
+// 启动后静默查一次，查不到（离线 / 限流）不打扰。
+//
+// 这一行的状态全收在下面几个变量里，只有 renderUpdateRow() 一处写 DOM。启动那次静默
+// 检查和用户手动点的那次可能同时在飞（静默那次走代理最长 20s），所以照 translateSeq
+// 的同一办法处理：每次检查领一个号，回来时号不是最新的那一次直接丢弃，不碰状态也不碰
+// DOM —— 否则「更早发出、更晚返回」的那次会把用户刚点出来的结果盖掉。
+let pendingUpdate = null;
+let updateChecking = false;
+let updateHint = "";
+let updateSeq = 0;
+let appVersion = "";
+let silentUpdateStarted = false;
+
+function renderUpdateRow() {
+  const btn = document.querySelector("#check-update-btn");
+  const hint = document.querySelector("#update-hint");
+  const versionEl = document.querySelector("#app-version");
+  if (versionEl) versionEl.textContent = appVersion || "-";
+  if (!btn || !hint) return;
+  btn.textContent = updateChecking ? "检查中…" : (pendingUpdate ? "打开下载页" : "检查更新");
+  btn.disabled = updateChecking;
+  btn.dataset.action = pendingUpdate ? "open" : "check";
+  hint.textContent = updateHint;
+}
+
+async function resolveAppVersion() {
+  if (appVersion) return;
+  try {
+    // getVersion 返回 Promise，不 await 就把一个 Promise 写进文本里了。
+    appVersion = (await window.__TAURI__?.app?.getVersion?.()) || "";
+  } catch (err) {
+    /* 浏览器预览里没有这个 API，留占位符 */
+  }
+  renderUpdateRow();
+}
+
+async function runUpdateCheck({ silent = false } = {}) {
+  const seq = ++updateSeq;
+  const isCurrent = () => seq === updateSeq;
+  updateChecking = true;
+  if (!silent) updateHint = "";
+  renderUpdateRow();
+
+  let info = null;
+  try {
+    info = await invoke("check_update");
+  } catch (err) {
+    if (!isCurrent()) return;
+    updateChecking = false;
+    if (!silent) updateHint = "检查失败，稍后再试";
+    renderUpdateRow();
+    return;
+  }
+  if (!isCurrent()) return;
+
+  updateChecking = false;
+  if (info && info.current) appVersion = info.current;
+  if (info && isNewerVersion(info.latest, info.current)) {
+    pendingUpdate = info;
+    // 静默那次也要把「有新版本」写在提示里：这行本来就是给用户看的。
+    updateHint = "有新版本 " + info.latest;
+  } else {
+    pendingUpdate = null;
+    if (!silent) updateHint = info ? "已是最新" : "查不到，稍后再试";
+  }
+  renderUpdateRow();
+}
+
+function bindUpdateRow() {
+  const btn = document.querySelector("#check-update-btn");
+  if (!btn) return;
+  btn.addEventListener("click", e => {
+    e.stopPropagation();
+    if (e.currentTarget.dataset.action === "open") {
+      invoke("open_release_page").catch(() => {});
+      return;
+    }
+    if (!updateChecking) runUpdateCheck();
+  });
+  // renderMain() 会整块换掉 innerHTML，所以每次重渲染都要把状态补回新节点，
+  // 而不是等下一次检查才把「打开下载页」显示出来。
+  renderUpdateRow();
+  resolveAppVersion();
+  if (!silentUpdateStarted) {
+    silentUpdateStarted = true;
+    runUpdateCheck({ silent: true });
+  }
+}
 
 async function bindMainListeners() {
   if (state.listenersBound || mode !== "main") return;
@@ -409,12 +636,13 @@ function renderMain() {
           <div class="app-title">Glance</div>
           <div class="lang-pill">
             <select id="from-lang">${languageOptions(state.settings.fromLang, state.settings.toLang === "auto")}</select>
-            <span class="lang-icon">➔</span>
+            <button type="button" class="lang-swap" id="lang-swap" title="交换源语言和目标语言" aria-label="交换源语言和目标语言">⇄</button>
             <select id="to-lang">${languageOptions(state.settings.toLang, state.settings.fromLang === "auto")}</select>
           </div>
         </div>
         <div class="header-right">
-          <button class="capture-btn" id="capture-btn" title="截图翻译">⛶ 截图翻译</button>
+          <button class="pin-btn${state.settings.pinOnTop ? " on" : ""}" id="pin-btn" title="置顶窗口" aria-label="置顶窗口" aria-pressed="${state.settings.pinOnTop ? "true" : "false"}"><svg class="pin-ico" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><rect x="3" y="2.2" width="10" height="4.4" rx="1.8"/><rect x="7" y="6.2" width="2" height="5.4" rx="1"/><path d="M6.3 11.6h3.4L8 14.4z"/></svg></button>
+          <button class="capture-btn" id="capture-btn" title="截图翻译">⛶ <span class="btn-label">截图翻译</span></button>
           <div class="lang-pill capture-pill" title="截图翻译目标语言">
             <span class="lang-icon">⛶</span>
             <select id="capture-to-lang">${languageOptions(state.settings.captureToLang, true, true)}</select>
@@ -476,6 +704,12 @@ function renderMain() {
                       value="${escapeHtml(state.settings.customProxy || "")}"
                       placeholder="http://127.0.0.1:7890" />
             </div>
+            <div class="settings-row">
+              <span class="settings-label">失败时使用备用引擎
+                <span class="settings-hint">开启后，原文可能发送给另一家翻译服务</span>
+              </span>
+              <button class="toggle ${state.settings.allowFallbackEngine ? "on" : ""}" id="allow-fallback-engine" aria-pressed="${Boolean(state.settings.allowFallbackEngine)}"></button>
+            </div>
           </div>
         </div>
         <div class="settings-section">
@@ -505,6 +739,14 @@ function renderMain() {
                 ${state.settings.popupShortcut ? shortcutKeysHtml(state.settings.popupShortcut) : "未设置"} <span class="shortcut-hint">点击可设置</span>
               </div>
             </div>
+            <div class="settings-row">
+              <span class="settings-label">版本</span>
+              <div class="update-row">
+                <span class="settings-hint" id="app-version">-</span>
+                <button type="button" class="update-btn" id="check-update-btn">检查更新</button>
+                <span class="settings-hint" id="update-hint"></span>
+              </div>
+            </div>
           </div>
         </div>
         <div class="settings-section" id="llm-settings" style="${state.settings.textTranslateEngine === "llm" ? "" : "display:none"}">
@@ -518,57 +760,58 @@ function renderMain() {
                       value="${escapeHtml(state.settings.llmConfig.baseUrl)}"
                       placeholder="https://api.openai.com/v1/chat/completions" />
             </div>
-          <div class="settings-row">
-            <span class="settings-label">API Key</span>
-            <input class="settings-input" id="llm-api-key" type="password"
-                    value="${escapeHtml(state.settings.llmConfig.apiKey)}"
-                    placeholder="sk-..." />
-          </div>
-          <div class="settings-row">
-            <span class="settings-label">模型</span>
-            <input class="settings-input" id="llm-model" type="text"
-                    value="${escapeHtml(state.settings.llmConfig.model)}"
-                    placeholder="gpt-4o-mini" />
-          </div>
-          <div class="settings-row">
-            <span class="settings-label">最大输出 Tokens</span>
-            <input class="settings-input" id="llm-max-tokens" type="number" min="1"
-                    value="${escapeHtml(state.settings.llmConfig.maxTokens || 4096)}" />
-          </div>
-          <div class="settings-row">
-            <span class="settings-label">提示词预设
-              <span class="settings-hint">风格与行业可组合，选择后覆盖下方自定义提示词</span>
-            </span>
-            <div class="preset-selects">
-              <select class="settings-input settings-select" id="llm-style-preset" title="翻译风格">
-                ${presetSelectOptions(LLM_STYLE_PRESETS, presetComboCurrent().style, true)}
-              </select>
-              <select class="settings-input settings-select" id="llm-industry-preset" title="行业术语">
-                ${presetSelectOptions(LLM_INDUSTRY_PRESETS, presetComboCurrent().industry, true)}
-              </select>
+            <div class="settings-row">
+              <span class="settings-label">API Key</span>
+              <input class="settings-input" id="llm-api-key" type="password"
+                      value="${escapeHtml(state.settings.llmConfig.apiKey)}"
+                      placeholder="sk-..." />
             </div>
-          </div>
-          <div class="settings-row">
-            <span class="settings-label" style="flex:0 0 auto">
-              高级选项
-              <span class="settings-hint">自定义提示词</span>
-            </span>
-            <button class="clear-btn" id="llm-advanced-toggle">${llmAdvancedExpanded() ? "收起" : "展开"}</button>
-          </div>
-          <div class="llm-advanced" id="llm-advanced" style="${llmAdvancedExpanded() ? "" : "display:none"}">
-            <div class="settings-row settings-row-vertical">
-              <span class="settings-label">提示词（指定源语言）
-                <span class="settings-hint">可用 {from} / {to} 表示源/目标语言</span>
-              </span>
-              <textarea class="settings-input settings-textarea" id="llm-prompt" rows="4"
-                      placeholder="${escapeHtml(defaultSettings().llmConfig.prompt)}">${escapeHtml(state.settings.llmConfig.prompt || "")}</textarea>
+            <div class="settings-row">
+              <span class="settings-label">模型</span>
+              <input class="settings-input" id="llm-model" type="text"
+                      value="${escapeHtml(state.settings.llmConfig.model)}"
+                      placeholder="gpt-4o-mini" />
             </div>
-            <div class="settings-row settings-row-vertical">
-              <span class="settings-label">提示词（自动检测源语言）
-                <span class="settings-hint">源语言为“自动检测”时使用，可用 {to}</span>
+            <div class="settings-row">
+              <span class="settings-label">最大输出 Tokens</span>
+              <input class="settings-input" id="llm-max-tokens" type="number" min="1"
+                      value="${escapeHtml(state.settings.llmConfig.maxTokens || 4096)}" />
+            </div>
+            <div class="settings-row">
+              <span class="settings-label">提示词预设
+                <span class="settings-hint">风格与行业可组合，选择后覆盖下方自定义提示词</span>
               </span>
-              <textarea class="settings-input settings-textarea" id="llm-auto-prompt" rows="4"
-                      placeholder="${escapeHtml(defaultSettings().llmConfig.autoPrompt)}">${escapeHtml(state.settings.llmConfig.autoPrompt || "")}</textarea>
+              <div class="preset-selects">
+                <select class="settings-input settings-select" id="llm-style-preset" title="翻译风格">
+                  ${presetSelectOptions(LLM_STYLE_PRESETS, presetComboCurrent().style, true)}
+                </select>
+                <select class="settings-input settings-select" id="llm-industry-preset" title="行业术语">
+                  ${presetSelectOptions(LLM_INDUSTRY_PRESETS, presetComboCurrent().industry, true)}
+                </select>
+              </div>
+            </div>
+            <div class="settings-row">
+              <span class="settings-label" style="flex:0 0 auto">
+                高级选项
+                <span class="settings-hint">自定义提示词</span>
+              </span>
+              <button class="clear-btn" id="llm-advanced-toggle">${llmAdvancedExpanded() ? "收起" : "展开"}</button>
+            </div>
+            <div class="llm-advanced" id="llm-advanced" style="${llmAdvancedExpanded() ? "" : "display:none"}">
+              <div class="settings-row settings-row-vertical">
+                <span class="settings-label">提示词（指定源语言）
+                  <span class="settings-hint">可用 {from} / {to} 表示源/目标语言</span>
+                </span>
+                <textarea class="settings-input settings-textarea" id="llm-prompt" rows="4"
+                        placeholder="${escapeHtml(defaultSettings().llmConfig.prompt)}">${escapeHtml(state.settings.llmConfig.prompt || "")}</textarea>
+              </div>
+              <div class="settings-row settings-row-vertical">
+                <span class="settings-label">提示词（自动检测源语言）
+                  <span class="settings-hint">源语言为“自动检测”时使用，可用 {to}</span>
+                </span>
+                <textarea class="settings-input settings-textarea" id="llm-auto-prompt" rows="4"
+                        placeholder="${escapeHtml(defaultSettings().llmConfig.autoPrompt)}">${escapeHtml(state.settings.llmConfig.autoPrompt || "")}</textarea>
+              </div>
             </div>
           </div>
         </div>
@@ -577,6 +820,12 @@ function renderMain() {
             <span class="section-arrow">▸</span> 存储
           </button>
           <div class="section-body" id="sec-storage-body" style="display:none">
+            <div class="settings-row">
+              <span class="settings-label">记录文本翻译历史
+                <span class="settings-hint">关闭时不会把完整原文和译文写入历史文件</span>
+              </span>
+              <button class="toggle ${state.settings.recordTextHistory ? "on" : ""}" id="record-text-history" aria-pressed="${Boolean(state.settings.recordTextHistory)}"></button>
+            </div>
             <div class="settings-row">
               <span class="settings-label">历史记录上限
                 <span class="settings-hint">建议 200，范围 0–2000（0 = 不记录）</span>
@@ -587,9 +836,9 @@ function renderMain() {
             </div>
             <div class="settings-row">
               <span class="settings-label">翻译缓存上限（条）
-                <span class="settings-hint">建议 200，范围 50–1000</span>
+                <span class="settings-hint">建议 200，范围 0–1000（0 = 关闭）</span>
               </span>
-              <input class="settings-input" id="cache-size" type="number" min="50" max="1000"
+              <input class="settings-input" id="cache-size" type="number" min="0" max="1000"
                       placeholder="200"
                       value="${escapeHtml(state.settings.cacheSize ?? 200)}" />
             </div>
@@ -617,23 +866,28 @@ function renderMain() {
   updateSides();
 
 // Events
-  inp.addEventListener("input", e => { state.leftText = e.target.value; state.activeSide = "left"; debouncedTranslate("left"); });
-  inp.addEventListener("keydown", e => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); translateText("left"); }
+  bindTranslationInput(inp, "left");
+  bindTranslationInput(inpR, "right");
+
+  // Switching language re-translates right away — no Enter needed.
+  document.querySelector("#from-lang").addEventListener("change", e => {
+    state.settings.fromLang = e.target.value;
+    refreshLangSelects();
+    settingsChangedAndRetranslate().catch(() => {});
   });
-  inp.addEventListener("paste", e => {
-    handlePaste("left", inp);
+  document.querySelector("#to-lang").addEventListener("change", e => {
+    state.settings.toLang = e.target.value;
+    refreshLangSelects();
+    settingsChangedAndRetranslate().catch(() => {});
   });
-  inpR.addEventListener("input", e => { state.rightText = e.target.value; state.activeSide = "right"; debouncedTranslate("right"); });
-  inpR.addEventListener("keydown", e => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); translateText("right"); }
+  document.querySelector("#lang-swap").addEventListener("click", e => {
+    e.stopPropagation();
+    swapLanguages();
   });
-  inpR.addEventListener("paste", e => {
-    handlePaste("right", inpR);
+  document.querySelector("#capture-to-lang").addEventListener("change", e => {
+    state.settings.captureToLang = e.target.value;
+    saveSettings().catch(() => {});
   });
-  document.querySelector("#from-lang").addEventListener("change", e => { state.settings.fromLang = e.target.value; translationSettingsChanged(); saveSettings().catch(()=>{}); refreshLangSelects(); });
-  document.querySelector("#to-lang").addEventListener("change", e => { state.settings.toLang = e.target.value; translationSettingsChanged(); saveSettings().catch(()=>{}); refreshLangSelects(); });
-  document.querySelector("#capture-to-lang").addEventListener("change", e => { state.settings.captureToLang = e.target.value; saveSettings().catch(()=>{}); });
 
   document.querySelector("#settings-btn").addEventListener("click", e => {
     e.stopPropagation();
@@ -659,6 +913,16 @@ function renderMain() {
   document.querySelector("#tts-btn").addEventListener("click", speakInput);
   document.querySelector("#tts-btn-right").addEventListener("click", speakInput);
 
+  // 版本 / 检查更新
+  bindUpdateRow();
+
+  // 置顶：状态从 settings 走，按钮高亮和窗口实际 topmost 都由 applyPin 同步。
+  document.querySelector("#pin-btn").addEventListener("click", e => {
+    e.stopPropagation();
+    state.settings.pinOnTop = !state.settings.pinOnTop;
+    applyPin();
+    saveSettings().catch(() => {});
+  });
   document.querySelector("#capture-btn").addEventListener("click", e => { e.stopPropagation(); startCapture(); });
   document.querySelector("#shortcut-row").addEventListener("click", e => { e.stopPropagation(); startHotkeyRecording(); });
   document.querySelector("#copy-shortcut-row").addEventListener("click", e => { e.stopPropagation(); startCopyHotkeyRecording(); });
@@ -670,8 +934,9 @@ function renderMain() {
       e.stopPropagation();
       const newEngine = e.currentTarget.dataset.engine;
       state.settings.textTranslateEngine = newEngine;
-      translationSettingsChanged();
-      saveSettings().catch(() => {});
+      // The engine is read from the saved settings by the Rust side, so this one
+      // waits for the write before re-running the translation.
+      retranslateNow({ awaitPersisted: true }).catch(() => {});
       // Update active state
       document.querySelectorAll("#engine-switcher .engine-btn").forEach(b => b.classList.toggle("active", b.dataset.engine === newEngine));
       // Toggle LLM settings visibility
@@ -691,18 +956,26 @@ function renderMain() {
       e.stopPropagation();
       const newMode = e.currentTarget.dataset.proxy;
       state.settings.proxyMode = newMode;
-      translationSettingsChanged();
-      saveSettings().catch(() => {});
       document.querySelectorAll("#proxy-switcher .engine-btn").forEach(b => b.classList.toggle("active", b.dataset.proxy === newMode));
       const customRow = document.querySelector("#custom-proxy-row");
       if (customRow) customRow.style.display = newMode === "custom" ? "" : "none";
+      settingsChangedAndRetranslate().catch(() => {});
       if (state.settingsOpen) {
         invoke?.("resize_main_window", { height: settingsHeight() }).catch(() => {});
       }
     });
   });
   const customProxyInput = document.querySelector("#custom-proxy");
-  if (customProxyInput) customProxyInput.addEventListener("change", e => { state.settings.customProxy = e.target.value.trim(); translationSettingsChanged(); saveSettings().catch(() => {}); });
+  if (customProxyInput) customProxyInput.addEventListener("change", e => {
+    state.settings.customProxy = e.target.value.trim();
+    settingsChangedAndRetranslate().catch(() => {});
+  });
+  document.querySelector("#allow-fallback-engine")?.addEventListener("click", e => {
+    state.settings.allowFallbackEngine = !state.settings.allowFallbackEngine;
+    e.currentTarget.classList.toggle("on", state.settings.allowFallbackEngine);
+    e.currentTarget.setAttribute("aria-pressed", String(state.settings.allowFallbackEngine));
+    saveSettings().catch(() => {});
+  });
 
   // LLM config inputs
   const baseUrlInput = document.querySelector("#llm-base-url");
@@ -710,11 +983,28 @@ function renderMain() {
   const modelInput = document.querySelector("#llm-model");
   const promptInput = document.querySelector("#llm-prompt");
   const autoPromptInput = document.querySelector("#llm-auto-prompt");
-  if (baseUrlInput) baseUrlInput.addEventListener("change", e => { state.settings.llmConfig.baseUrl = e.target.value.trim(); translationSettingsChanged(); saveSettings().catch(() => {}); });
-  if (apiKeyInput) apiKeyInput.addEventListener("change", e => { state.settings.llmConfig.apiKey = e.target.value.trim(); translationSettingsChanged(); saveSettings().catch(() => {}); });
-  if (modelInput) modelInput.addEventListener("change", e => { state.settings.llmConfig.model = e.target.value.trim(); translationSettingsChanged(); saveSettings().catch(() => {}); });
-  if (promptInput) promptInput.addEventListener("change", e => { state.settings.llmConfig.prompt = e.target.value; syncPresetSelects(); translationSettingsChanged(); saveSettings().catch(() => {}); });
-  if (autoPromptInput) autoPromptInput.addEventListener("change", e => { state.settings.llmConfig.autoPrompt = e.target.value; syncPresetSelects(); translationSettingsChanged(); saveSettings().catch(() => {}); });
+  if (baseUrlInput) baseUrlInput.addEventListener("change", e => {
+    state.settings.llmConfig.baseUrl = e.target.value.trim();
+    settingsChangedAndRetranslate().catch(() => {});
+  });
+  if (apiKeyInput) apiKeyInput.addEventListener("change", e => {
+    state.settings.llmConfig.apiKey = e.target.value.trim();
+    settingsChangedAndRetranslate().catch(() => {});
+  });
+  if (modelInput) modelInput.addEventListener("change", e => {
+    state.settings.llmConfig.model = e.target.value.trim();
+    settingsChangedAndRetranslate().catch(() => {});
+  });
+  if (promptInput) promptInput.addEventListener("change", e => {
+    state.settings.llmConfig.prompt = e.target.value;
+    syncPresetSelects();
+    settingsChangedAndRetranslate().catch(() => {});
+  });
+  if (autoPromptInput) autoPromptInput.addEventListener("change", e => {
+    state.settings.llmConfig.autoPrompt = e.target.value;
+    syncPresetSelects();
+    settingsChangedAndRetranslate().catch(() => {});
+  });
 
   // Keep both preset selects in sync when the user edits the prompts.
   function syncPresetSelects() {
@@ -736,8 +1026,7 @@ function renderMain() {
     const a = document.querySelector("#llm-auto-prompt");
     if (p) p.value = built.prompt;
     if (a) a.value = built.autoPrompt;
-    translationSettingsChanged();
-    saveSettings().catch(() => {});
+    settingsChangedAndRetranslate().catch(() => {});
   }
 
   document.querySelector("#llm-style-preset")?.addEventListener("change", e => {
@@ -782,11 +1071,16 @@ function renderMain() {
     const v = parseInt(e.target.value, 10);
     state.settings.llmConfig.maxTokens = Number.isFinite(v) && v > 0 ? v : 4096;
     maxTokensInput.value = state.settings.llmConfig.maxTokens;
-    translationSettingsChanged();
-    saveSettings().catch(() => {});
+    settingsChangedAndRetranslate().catch(() => {});
   });
 
   // Storage section: limits + clear buttons
+  document.querySelector("#record-text-history")?.addEventListener("click", e => {
+    state.settings.recordTextHistory = !state.settings.recordTextHistory;
+    e.currentTarget.classList.toggle("on", state.settings.recordTextHistory);
+    e.currentTarget.setAttribute("aria-pressed", String(state.settings.recordTextHistory));
+    saveSettings().catch(() => {});
+  });
   const historyLimitInput = document.querySelector("#history-limit");
   if (historyLimitInput) historyLimitInput.addEventListener("change", e => {
     let v = parseInt(e.target.value, 10);
@@ -800,7 +1094,7 @@ function renderMain() {
   if (cacheSizeInput) cacheSizeInput.addEventListener("change", e => {
     let v = parseInt(e.target.value, 10);
     if (!Number.isFinite(v)) v = 200;
-    v = Math.min(1000, Math.max(50, v));
+    v = Math.min(1000, Math.max(0, v));
     state.settings.cacheSize = v;
     cacheSizeInput.value = v;
     saveSettings().catch(() => {});
@@ -875,6 +1169,8 @@ function renderMain() {
     }).catch(() => {});
   });
 
+  // 启动时把已保存的置顶状态回写到窗口上（Rust 侧 setup 阶段窗口可能还没建好）。
+  applyPin();
   (state.activeSide === "right" ? inpR : inp).focus();
 }
 
@@ -1046,7 +1342,13 @@ async function translateText(side) {
   }
 
   try {
-    const r = await invoke("translate_text", { text, fromLang, toLang, sourceSide: side });
+    const r = await invoke("translate_text", {
+      text,
+      fromLang,
+      toLang,
+      sourceSide: side,
+      requestId: seq
+    });
     if (!isCurrentTranslation(seq, side, contextKey)) return;
     if (isLeft) state.rightText = r.translatedText;
     else state.leftText = r.translatedText;
